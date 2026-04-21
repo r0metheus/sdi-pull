@@ -48,26 +48,26 @@ The `playwright install chromium` step downloads a self-contained Chromium build
 
 ```bash
 # Download all issued invoices from Jan 1, 2026 to today
-python sdi-pull.py download --vat-id XXXXXXXXXXX --from 2026-01-01
+python sdi-pull.py download --from 2026-01-01
 
 # Download received invoices only
-python sdi-pull.py download --vat-id XXXXXXXXXXX --from 2026-01-01 --type received
+python sdi-pull.py download --from 2026-01-01 --type received
 
 # Download both issued and received
-python sdi-pull.py download --vat-id XXXXXXXXXXX --from 2026-01-01 --type all
+python sdi-pull.py download --from 2026-01-01 --type all
 
 # Custom output directory
-python sdi-pull.py download --vat-id XXXXXXXXXXX --from 2026-01-01 --output ./my-invoices
+python sdi-pull.py download --from 2026-01-01 --output ./my-invoices
 ```
 
 ### List invoices (no download)
 
 ```bash
 # List issued invoices
-python sdi-pull.py list --vat-id XXXXXXXXXXX --from 2026-01-01
+python sdi-pull.py list --from 2026-01-01
 
 # List all invoices (issued + received)
-python sdi-pull.py list --vat-id XXXXXXXXXXX --from 2026-01-01 --type all
+python sdi-pull.py list --from 2026-01-01 --type all
 ```
 
 ### Commands reference
@@ -81,10 +81,11 @@ python sdi-pull.py list --vat-id XXXXXXXXXXX --from 2026-01-01 --type all
 
 | Option      | Description                              | Default   |
 |-------------|------------------------------------------|-----------|
-| `--vat-id`  | VAT number (Partita IVA)                 | required  |
 | `--from`    | Start date (YYYY-MM-DD)                  | required  |
 | `--type`    | `issued`, `received`, or `all`           | `issued`  |
 | `--output`  | Output directory (download only)         | `output`  |
+
+The VAT number is not required — the session is scoped to the logged-in identity, so all queries automatically return invoices for the authenticated user's work role.
 
 ## Output structure
 
