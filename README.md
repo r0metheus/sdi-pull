@@ -1,0 +1,109 @@
+# sdi-pull
+
+CLI tool to bulk-download electronic invoices (Fatture Elettroniche) as XML from the Italian Revenue Agency (Agenzia delle Entrate) portal — the invoices managed by the SdI (Sistema di Interscambio).
+
+## How it works
+
+1. Opens a Chromium window to the Agenzia delle Entrate portal
+2. You complete CIE authentication (QR code or CIE + PIN)
+3. The tool automatically captures session cookies and security tokens
+4. Browser closes, and all invoices are downloaded via API in the background
+
+The portal limits queries to 3-month windows — the tool handles this automatically by splitting the date range.
+
+## Installation
+
+```bash
+git clone <repo-url> && cd sdi-pull
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+playwright install chromium
+```
+
+The `playwright install chromium` step downloads a self-contained Chromium build — no system browser required.
+
+## Usage
+
+### Download invoices
+
+```bash
+# Download all issued invoices from Jan 1, 2026 to today
+python sdi-pull.py download --vat-id XXXXXXXXXXX --from 2026-01-01
+
+# Download received invoices only
+python sdi-pull.py download --vat-id XXXXXXXXXXX --from 2026-01-01 --type received
+
+# Download both issued and received
+python sdi-pull.py download --vat-id XXXXXXXXXXX --from 2026-01-01 --type all
+
+# Custom output directory
+python sdi-pull.py download --vat-id XXXXXXXXXXX --from 2026-01-01 --output ./my-invoices
+```
+
+### List invoices (no download)
+
+```bash
+# List issued invoices
+python sdi-pull.py list --vat-id XXXXXXXXXXX --from 2026-01-01
+
+# List all invoices (issued + received)
+python sdi-pull.py list --vat-id XXXXXXXXXXX --from 2026-01-01 --type all
+```
+
+### Commands reference
+
+| Command    | Description                                |
+|------------|--------------------------------------------|
+| `download` | Download invoice XML files                 |
+| `list`     | List invoices in a table without downloading |
+
+### Common options
+
+| Option      | Description                              | Default   |
+|-------------|------------------------------------------|-----------|
+| `--vat-id`  | VAT number (Partita IVA)                 | required  |
+| `--from`    | Start date (YYYY-MM-DD)                  | required  |
+| `--type`    | `issued`, `received`, or `all`           | `issued`  |
+| `--output`  | Output directory (download only)         | `output`  |
+
+## Output structure
+
+```
+output/
+  issued/
+    issued_invoice_1.xml
+    issued_invoice_2.xml
+    summary.json
+  received/
+    received_invoice_1.xml
+    summary.json
+```
+
+Each XML file is the original electronic invoice as stored by AdE. The `summary.json` contains metadata for all invoices in that category.
+
+## Features
+
+- [x] CIE authentication via browser (automatic session capture)
+- [x] Download issued invoices as XML (domestic + cross-border)
+- [x] Download received invoices as XML (domestic + cross-border)
+- [x] Automatic 3-month window splitting
+- [x] Skip already downloaded files (incremental)
+- [x] List invoices without downloading
+- [x] JSON summary export
+- [x] Rich terminal UI (tables, progress bars, spinners)
+- [x] Session caching (`~/.sdi-pull/session.json`) — skips login if session is still valid
+
+## Roadmap
+
+- [ ] Filter by counterpart (client/supplier name or VAT)
+- [ ] Filter by date range (custom end date, not just today)
+- [ ] Filter by invoice amount
+
+## Requirements
+
+- Python 3.10+
+
+## License
+
+GPLv3
