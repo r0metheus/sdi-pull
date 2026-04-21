@@ -2,6 +2,25 @@
 
 CLI tool to bulk-download electronic invoices (Fatture Elettroniche) as XML from the Italian Revenue Agency (Agenzia delle Entrate) portal — the invoices managed by the SdI (Sistema di Interscambio).
 
+## Intended use
+
+This tool is for **personal use by the holder of the credentials**. It logs in with **your** CIE (or SPID/CNS, if the portal allows) via a real browser you control, captures **your** session tokens from **your** browser's localStorage, and downloads **your own** invoices through the same public API endpoints the official web console (`ivaservizi.agenziaentrate.gov.it/cons/cons-web/`) already calls.
+
+It does **not**:
+
+- bypass or weaken any authentication mechanism,
+- access data belonging to third parties,
+- scrape, enumerate, or brute-force anything,
+- store or transmit your credentials (the CIE flow happens entirely in the browser window you see).
+
+Think of it as a convenience wrapper that clicks "Download XML" on every invoice for you, instead of doing it by hand.
+
+## Disclaimer
+
+This project is **not affiliated with, endorsed by, or sponsored by Agenzia delle Entrate** or any Italian government body. The portal's API endpoints are undocumented and can change without notice — if AdE changes the SPA, this tool may stop working until updated. No warranty, no guarantees of fitness for any purpose (see the [LICENSE](LICENSE)).
+
+Use of the Agenzia delle Entrate portal is subject to its own Terms of Service. By running this tool, you are responsible for ensuring your use complies with those terms and with applicable law. The author provides the code; you run it under your own identity and responsibility.
+
 ## How it works
 
 1. Opens a Chromium window to the Agenzia delle Entrate portal
