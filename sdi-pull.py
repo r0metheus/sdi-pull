@@ -162,16 +162,31 @@ def _wait_for_login(context, timeout_s: int = 300) -> bool:
     return False
 
 
-def _read_tokens(page) -> dict[str, str]:
+def _read_tokens_from_context(context) -> dict[str, str]:
     """
-    Read x-b2bcookie and x-token from the SPA's localStorage.
-    The Angular app stores them as FattCorrActiveB2B / FattCorrActiveToken.
+    Read x-b2bcookie and x-token from the SPA's localStorage across all
+    open pages. localStorage is origin-scoped, so the tokens only exist
+    on pages served from ivaservizi.agenziaentrate.gov.it — we scan every
+    page rather than binding to one that might have navigated away.
     """
-    result = page.evaluate("""() => ({
-        'x-b2bcookie': localStorage.getItem('FattCorrActiveB2B') || '',
-        'x-token': localStorage.getItem('FattCorrActiveToken') || '',
-    })""")
-    return {k: v for k, v in result.items() if v}
+    for p in context.pages:
+        try:
+            url = p.url
+        except Exception:
+            continue
+        if "ivaservizi.agenziaentrate.gov.it" not in url:
+            continue
+        try:
+            result = p.evaluate("""() => ({
+                'x-b2bcookie': localStorage.getItem('FattCorrActiveB2B') || '',
+                'x-token': localStorage.getItem('FattCorrActiveToken') || '',
+            })""")
+        except Exception:
+            continue
+        tokens = {k: v for k, v in result.items() if v}
+        if "x-b2bcookie" in tokens and "x-token" in tokens:
+            return tokens
+    return {}
 
 
 def _browser_login() -> tuple[dict[str, str], dict[str, str]]:
@@ -184,7 +199,7 @@ def _browser_login() -> tuple[dict[str, str], dict[str, str]]:
 
         console.print(Panel(
             "[bold]Complete CIE authentication in the browser window.[/bold]\n"
-            "The browser will close automatically after login.",
+            "The browser will close automatically once the session is ready.",
             title="CIE Login",
             border_style="cyan",
         ))
@@ -198,19 +213,39 @@ def _browser_login() -> tuple[dict[str, str], dict[str, str]]:
 
         console.print("[green]Login detected.[/]")
 
-        # Tokens appear in localStorage only after the invoices SPA loads.
-        # After CIE login the browser lands on the routing page, so we
-        # navigate to the invoices console to trigger token generation.
-        custom_headers = _read_tokens(page)
-        if not custom_headers:
-            with console.status("[cyan]Loading invoices console...", spinner="dots"):
-                page.goto(f"{CONSOLE_URL}?v={_ts()}#/fatture/emesse")
-                page.wait_for_load_state("networkidle")
-                time.sleep(3)
-                custom_headers = _read_tokens(page)
+        # Let the post-login landing page (/instr/InstradamentofcWeb/...)
+        # finish its own redirects before we navigate away — interrupting it
+        # mid-flight is what was bouncing the user back to the login page.
+        try:
+            page.wait_for_load_state("networkidle", timeout=30000)
+        except Exception:
+            pass
+
+        # Navigate straight to the invoices console home and wait for the
+        # SPA to finish populating localStorage. No further user interaction.
+        with console.status("[cyan]Loading invoices console...", spinner="dots"):
+            try:
+                page.goto(CONSOLE_URL)
+                page.wait_for_load_state("networkidle", timeout=60000)
+            except Exception:
+                pass
+
+            deadline = time.monotonic() + 60
+            custom_headers: dict[str, str] = {}
+            while time.monotonic() < deadline:
+                custom_headers = _read_tokens_from_context(context)
+                if (
+                    "x-b2bcookie" in custom_headers
+                    and "x-token" in custom_headers
+                ):
+                    break
+                time.sleep(1)
 
         if "x-b2bcookie" not in custom_headers or "x-token" not in custom_headers:
-            console.print("[bold red]Error:[/] session tokens not found in localStorage.")
+            console.print(
+                "[bold red]Error:[/] session tokens not found in localStorage "
+                "after loading the invoices console."
+            )
             browser.close()
             sys.exit(1)
 
