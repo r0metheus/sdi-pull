@@ -8,6 +8,7 @@ sdi-pull - Download electronic invoices (XML) from the Italian SdI
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import date, datetime, timedelta
@@ -27,12 +28,15 @@ CONSOLE_URL = "https://ivaservizi.agenziaentrate.gov.it/cons/cons-web/"
 MAX_WINDOW_DAYS = 90
 HTTP_TIMEOUT = 30
 
-# The /fe/emesse/.../piva/{piva} endpoint requires an 11-digit placeholder in
-# the path but the backend scopes the query by session tokens and ignores the
-# value — passing a different VAT still returns the logged-in user's invoices.
-# If AdE ever starts validating this, read the active VAT from localStorage
-# (FattCorrActive* keys) instead.
+# The /fe/emesse/.../piva/{piva} endpoint requires an 11-digit value in the
+# path. In the self-service case (user logged in with their own CIE) the
+# backend scopes the query by session tokens and ignores the path param —
+# any 11-digit placeholder works. In the delegated case (commercialista
+# logged in with CIE operating on behalf of an assistito) the path param
+# may be used to select the target entity, so callers should pass the real
+# VAT when operating under delegation.
 PIVA_PATH_PLACEHOLDER = "00000000000"
+VAT_ID_RE = re.compile(r"^\d{11}$")
 
 DEFAULT_HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -293,20 +297,26 @@ def authenticate() -> tuple[dict[str, str], dict[str, str]]:
 # ---------------------------------------------------------------------------
 
 def _fetch_domestic(
-    session: requests.Session, kind: str, start: date, end: date,
+    session: requests.Session,
+    kind: str,
+    start: date,
+    end: date,
+    vat_id: str | None = None,
 ) -> list[dict]:
     """
     Fetch domestic invoice list.
 
     - emesse:   /fe/emesse/dal/.../al/.../piva/{piva}            (filters by issue date;
-                piva in path is ignored by the backend — session-scoped)
+                piva in path is typically session-scoped, but is honored under
+                delegation — pass the target VAT when operating as a delegate)
     - ricevute: /fe/ricevute/dal/.../al/.../ricerca/ricezione    (filters by reception date;
                 authenticated user is implicit recipient)
     """
     if kind == "emesse":
+        piva = vat_id or PIVA_PATH_PLACEHOLDER
         url = (
             f"{BASE_URL}/fe/emesse/dal/{_fmt_date(start)}/al/{_fmt_date(end)}"
-            f"/piva/{PIVA_PATH_PLACEHOLDER}?v={_ts()}"
+            f"/piva/{piva}?v={_ts()}"
         )
     else:
         url = (
@@ -336,9 +346,10 @@ def fetch_invoice_list(
     kind: str,
     start: date,
     end: date,
+    vat_id: str | None = None,
 ) -> list[dict]:
     """Fetch both domestic and cross-border invoices, merged and deduplicated."""
-    domestic = _fetch_domestic(session, kind, start, end)
+    domestic = _fetch_domestic(session, kind, start, end, vat_id=vat_id)
     cross_border = _fetch_cross_border(session, kind, start, end)
 
     # Deduplicate by idFattura (in case an invoice appears in both)
@@ -369,7 +380,10 @@ def download_xml(session: requests.Session, send_type: str, invoice_id: str) -> 
 # ---------------------------------------------------------------------------
 
 def _validate_common_args(args: argparse.Namespace) -> tuple[date, date]:
-    """Validate --from, return (start_date, end_date). Exits on error."""
+    """Validate --vat-id (if provided) and --from, return (start_date, end_date)."""
+    if getattr(args, "vat_id", None) and not VAT_ID_RE.match(args.vat_id):
+        console.print("[bold red]Error:[/] --vat-id must be exactly 11 digits.")
+        sys.exit(1)
     try:
         start_date = datetime.strptime(args.from_date, "%Y-%m-%d").date()
     except ValueError:
@@ -437,7 +451,9 @@ def cmd_download(args: argparse.Namespace) -> None:
                 f"[cyan]Fetching {label} invoices {r_start} to {r_end}...",
                 spinner="dots",
             ):
-                invoices = fetch_invoice_list(session, api_kind, r_start, r_end)
+                invoices = fetch_invoice_list(
+                    session, api_kind, r_start, r_end, vat_id=args.vat_id,
+                )
                 all_invoices.extend(invoices)
             console.print(
                 f"  {r_start} to {r_end}: "
@@ -554,7 +570,9 @@ def cmd_list(args: argparse.Namespace) -> None:
                 spinner="dots",
             ):
                 all_invoices.extend(
-                    fetch_invoice_list(session, api_kind, r_start, r_end)
+                    fetch_invoice_list(
+                        session, api_kind, r_start, r_end, vat_id=args.vat_id,
+                    )
                 )
 
         if not all_invoices:
@@ -611,6 +629,12 @@ def build_parser() -> argparse.ArgumentParser:
     dl = subparsers.add_parser("download", help="Download invoice XML files")
     dl.add_argument("--from", dest="from_date", required=True, help="Start date (YYYY-MM-DD)")
     dl.add_argument(
+        "--vat-id",
+        default=None,
+        help="Target VAT (Partita IVA). Only needed when operating under "
+             "delegation for a third party; omit for self-service.",
+    )
+    dl.add_argument(
         "--type",
         choices=["issued", "received", "all"],
         default="issued",
@@ -621,6 +645,12 @@ def build_parser() -> argparse.ArgumentParser:
     # -- list --
     ls = subparsers.add_parser("list", help="List invoices without downloading")
     ls.add_argument("--from", dest="from_date", required=True, help="Start date (YYYY-MM-DD)")
+    ls.add_argument(
+        "--vat-id",
+        default=None,
+        help="Target VAT (Partita IVA). Only needed when operating under "
+             "delegation for a third party; omit for self-service.",
+    )
     ls.add_argument(
         "--type",
         choices=["issued", "received", "all"],

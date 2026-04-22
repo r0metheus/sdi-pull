@@ -79,13 +79,16 @@ python sdi-pull.py list --from 2026-01-01 --type all
 
 ### Common options
 
-| Option      | Description                              | Default   |
-|-------------|------------------------------------------|-----------|
-| `--from`    | Start date (YYYY-MM-DD)                  | required  |
-| `--type`    | `issued`, `received`, or `all`           | `issued`  |
-| `--output`  | Output directory (download only)         | `output`  |
+| Option      | Description                                              | Default   |
+|-------------|----------------------------------------------------------|-----------|
+| `--from`    | Start date (YYYY-MM-DD)                                  | required  |
+| `--type`    | `issued`, `received`, or `all`                           | `issued`  |
+| `--output`  | Output directory (download only)                         | `output`  |
+| `--vat-id`  | Target Partita IVA (only under delegation; see below)    | none      |
 
-The VAT number is not required — the session is scoped to the logged-in identity, so all queries automatically return invoices for the authenticated user's work role.
+For self-service (user logged in with their own CIE), `--vat-id` is not needed — the session is scoped to the authenticated identity.
+
+For delegated access (e.g. a commercialista logged in with their own CIE, operating on behalf of an assistito), pass `--vat-id` with the target VAT so the query is routed to the correct entity.
 
 ## Output structure
 
@@ -126,4 +129,6 @@ Each XML file is the original electronic invoice as stored by AdE. The `summary.
 
 ## License
 
-GPLv3
+Licensed under the [GNU Affero General Public License v3.0 or later](LICENSE) (AGPL-3.0-or-later).
+
+If you run a modified version of this software as part of a network-accessible service, you are required to make the corresponding source code available to the users of that service. Local use (CLI, desktop, private scripts) carries no additional obligations beyond standard GPL terms.
