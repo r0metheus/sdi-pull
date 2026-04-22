@@ -64,7 +64,13 @@ uv run sdi-pull.py download --from 2026-01-01
 ### Download invoices
 
 ```bash
-# All issued invoices from Jan 1, 2026 to today
+# Default window: last 365 days, until today
+./sdi-pull.py download
+
+# Specific window
+./sdi-pull.py download --from 2026-01-01 --to 2026-04-22
+
+# Open-ended window (--to defaults to today)
 ./sdi-pull.py download --from 2026-01-01
 
 # Received invoices only
@@ -75,17 +81,29 @@ uv run sdi-pull.py download --from 2026-01-01
 
 # Custom output directory
 ./sdi-pull.py download --from 2026-01-01 --output ./my-invoices
-
-# Operating under delegation for a third-party VAT
-./sdi-pull.py download --from 2026-01-01 --vat-id 12345678901
 ```
 
 ### List invoices (no download)
 
 ```bash
-./sdi-pull.py list --from 2026-01-01
-./sdi-pull.py list --from 2026-01-01 --type all
+./sdi-pull.py list
+./sdi-pull.py list --from 2026-01-01 --to 2026-04-22
+./sdi-pull.py list --type all
 ```
+
+### Yearly recap
+
+Both commands end with a recap grouped by tax year:
+
+- **Fatturato** — total of issued invoices (`imponibile`)
+- **Costi** — total of received invoices (`imponibile`)
+- **IVA emessa / ricevuta** — VAT totals restricted to domestic IT→IT transactions (cross-border amounts are excluded from VAT since they don't carry Italian VAT)
+- **Saldo IVA** — `IVA emessa − IVA ricevuta`, i.e. net VAT position per year
+
+Two levels of accuracy, depending on the command:
+
+- `list` shows a **fast preview** built from the listing-endpoint metadata. Fatturato and costi are accurate; IVA values may be off because AdE's list payload is unreliable for this field.
+- `download` recomputes the recap **from every downloaded XML**, summing `<DatiRiepilogo>/<Imposta>` and `<ImponibileImporto>` across all rate blocks. XMLs are parsed in parallel after downloads finish. These are the totals to trust for fiscal purposes.
 
 ### Commands reference
 
@@ -96,31 +114,62 @@ uv run sdi-pull.py download --from 2026-01-01
 
 ### Common options
 
-| Option      | Description                                              | Default   |
-|-------------|----------------------------------------------------------|-----------|
-| `--from`    | Start date (YYYY-MM-DD)                                  | required  |
-| `--type`    | `issued`, `received`, or `all`                           | `issued`  |
-| `--output`  | Output directory (download only)                         | `output`  |
-| `--vat-id`  | Target Partita IVA (only under delegation; see below)    | none      |
+| Option      | Description                                                 | Default                 |
+|-------------|-------------------------------------------------------------|-------------------------|
+| `--from`    | Start date (YYYY-MM-DD)                                     | 365 days before today   |
+| `--to`      | End date (YYYY-MM-DD)                                       | today                   |
+| `--type`    | `issued`, `received`, or `all`                              | `issued`                |
+| `--output`  | Output directory (download only)                            | `output`                |
+| `--delay`   | Seconds to wait after each AdE API call (throttling)        | `0.5`                   |
 
-For self-service (user logged in with their own CIE), `--vat-id` is not needed — the session is scoped to the authenticated identity.
+All queries are session-scoped — the authenticated identity (or the currently selected "utenza di lavoro") determines what's returned. No VAT argument is required. Delegation support (multi-entity selection for commercialisti) is planned for a later release.
 
-For delegated access (e.g. a commercialista logged in with their own CIE, operating on behalf of an assistito), pass `--vat-id` with the target VAT so the query is routed to the correct entity.
+### Throttling
+
+Every outgoing call to AdE is followed by a configurable sleep via `--delay` (default 0.5s). The portal publishes no rate limits, but a gentle cadence avoids triggering server-side anomaly detection — especially when pulling large historical windows.
+
+```bash
+./sdi-pull.py download --delay 0      # no throttling (fastest, more aggressive)
+./sdi-pull.py download --delay 2      # gentle — good for multi-year backfills
+```
+
+The delay applies to every API call (list endpoints, XML downloads). It does **not** slow down the local XML parsing phase, which happens in parallel after downloads complete.
 
 ## Output structure
+
+Files are split by **year of the invoice date** and then by **counterpart country**:
 
 ```
 output/
   issued/
-    issued_invoice_1.xml
-    issued_invoice_2.xml
-    summary.json
+    2024/
+      italiane/           # counterpart is IT
+        FPR12345...xml
+      transfrontaliere/   # counterpart is non-IT
+        FPR67890...xml
+      summary.json        # metadata for every issued invoice dated 2024
+    2025/
+      italiane/
+      transfrontaliere/
+      summary.json
   received/
-    received_invoice_1.xml
-    summary.json
+    2024/
+      italiane/
+      transfrontaliere/
+      summary.json
+    2025/
+      ...
 ```
 
-Each XML file is the original electronic invoice as stored by AdE. The `summary.json` contains metadata for all invoices in that category.
+Each XML is the original fatturapa document as stored by AdE. `summary.json` in each year folder contains the listing-endpoint metadata for every invoice dated in that year, regardless of the italiane/transfrontaliere split.
+
+### How the recap totals are computed
+
+- **Fatturato / Costi** = `<ImportoTotaleDocumento>` minus any `<ImportoRitenuta>` (ritenuta d'acconto). This matches the "netto a pagare" that Italian accountants use as fatturato — i.e. the amount the client actually pays.
+- **Credit notes (TD04, TD08)** are **subtracted** — a credit note that cancels a previous invoice brings the net contribution back to zero.
+- **Tax-integration documents (TD16–TD23, TD28)** — integrazioni, autofatture, estrazioni Deposito IVA, registrazione SM — are **skipped entirely**, because they aren't real commercial transactions.
+- **IVA emessa / ricevuta** are restricted to domestic IT→IT invoices (cross-border invoices under reverse charge carry no Italian VAT). IVA is computed from `<DatiRiepilogo>/<Imposta>` summed across every rate block.
+- Skipped / subtracted / missing documents are still **downloaded and kept** in the correct year/country folder — the filter only affects the recap totals.
 
 ## Features
 
@@ -133,6 +182,7 @@ Each XML file is the original electronic invoice as stored by AdE. The `summary.
 - [x] JSON summary export
 - [x] Rich terminal UI (tables, progress bars, spinners)
 - [x] Session caching (`~/.sdi-pull/session.json`) — skips login if session is still valid
+- [x] Yearly recap (fatturato, costi, IVA) grouped by tax year
 
 ## Roadmap
 

@@ -19,6 +19,8 @@ import os
 import re
 import sys
 import time
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -43,8 +45,29 @@ HTTP_TIMEOUT = 30
 # logged in with CIE operating on behalf of an assistito) the path param
 # may be used to select the target entity, so callers should pass the real
 # VAT when operating under delegation.
-PIVA_PATH_PLACEHOLDER = "00000000000"
-VAT_ID_RE = re.compile(r"^\d{11}$")
+# Fatturapa TipoDocumento classification for the recap:
+#   - CREDIT_NOTE  -> SUBTRACTED (they reverse a previous invoice; net effect
+#                      on fatturato/IVA should be negative).
+#   - NON_COMMERCIAL -> SKIPPED entirely (integrazioni, autofatture, estrazioni
+#                      Deposito IVA, registrazione SM: tax-compliance docs,
+#                      not real commercial transactions).
+# Every other TD code (TD01/02/03/05/06/07/09/24/25/26/27) is added.
+CREDIT_NOTE_TD_CODES = frozenset({"TD04", "TD08"})
+NON_COMMERCIAL_TD_CODES = frozenset({
+    "TD16", "TD17", "TD18", "TD19", "TD20", "TD21", "TD22", "TD23", "TD28",
+})
+
+# Delay inserted after each outgoing AdE HTTP call. Set from the --delay CLI
+# arg at startup; 0 means no throttling. Keep this conservative by default:
+# the portal has never published rate limits, but a gentle cadence reduces
+# the chance of triggering server-side anomaly detection.
+API_DELAY = 0.5
+
+
+def _throttle() -> None:
+    """Sleep API_DELAY seconds if throttling is enabled."""
+    if API_DELAY > 0:
+        time.sleep(API_DELAY)
 
 DEFAULT_HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -87,6 +110,131 @@ def _date_ranges(start: date, end: date) -> list[tuple[date, date]]:
 def _fmt_date(d: date) -> str:
     """Format date as DDMMYYYY for the API."""
     return d.strftime("%d%m%Y")
+
+
+def _parse_amount(s: str | None) -> float:
+    """Parse an AdE amount string (e.g. '+000000001234.56' or '-1234,56')."""
+    if not s:
+        return 0.0
+    s = s.strip()
+    if s.startswith("+"):
+        s = s[1:]
+    s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def _parse_invoice_year(s: str | None) -> int | None:
+    """Extract the year from an AdE invoice date, trying common formats."""
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y%m%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s, fmt).year
+        except ValueError:
+            continue
+    m = re.search(r"(19|20)\d{2}", s)
+    return int(m.group(0)) if m else None
+
+
+def _invoice_year_folder(inv: dict) -> str:
+    """Year bucket for directory layout; 'unknown' if date can't be parsed."""
+    y = _parse_invoice_year(inv.get("dataFattura"))
+    return str(y) if y else "unknown"
+
+
+def _invoice_country_bucket(inv: dict, label: str) -> str:
+    """'italiane' for IT→IT counterparts, otherwise 'transfrontaliere'."""
+    country_key = "idPaeseCedente" if label == "received" else "idPaeseCessionario"
+    return "italiane" if inv.get(country_key) == "IT" else "transfrontaliere"
+
+
+def _invoice_output_path(inv: dict, label_dir: Path, label: str) -> Path:
+    """Compute the target XML path under <label>/<year>/<italiane|transfrontaliere>."""
+    file_id = f"{inv.get('tipoInvio', '')}{inv.get('idFattura', '')}"
+    return (
+        label_dir
+        / _invoice_year_folder(inv)
+        / _invoice_country_bucket(inv, label)
+        / f"{file_id}.xml"
+    )
+
+
+def _local_tag(el: ET.Element) -> str:
+    """Return an XML element's tag name without its namespace prefix."""
+    return el.tag.split("}", 1)[-1] if "}" in el.tag else el.tag
+
+
+def _parse_fatturapa_xml(xml_path: Path) -> list[dict]:
+    """
+    Parse a fatturapa XML and return one record per FatturaElettronicaBody.
+
+    Each record: {"year": int | None, "imponibile": float, "imposta": float}.
+
+    The authoritative IVA totals live inside DatiBeniServizi/DatiRiepilogo
+    (multiple blocks per invoice, one per rate). This is what fiscal accounting
+    actually uses — the metadata 'imposta' field from the listing endpoint is
+    unreliable and should not be trusted for VAT calculations.
+    """
+    try:
+        tree = ET.parse(xml_path)
+    except (ET.ParseError, FileNotFoundError, OSError):
+        return []
+
+    root = tree.getroot()
+    bodies = [e for e in root.iter() if _local_tag(e) == "FatturaElettronicaBody"]
+    if not bodies:
+        bodies = [root]
+
+    records: list[dict] = []
+    for body in bodies:
+        year: int | None = None
+        tipo_doc: str | None = None
+        totale = 0.0
+        ritenute = 0.0
+        for gen in body.iter():
+            if _local_tag(gen) != "DatiGeneraliDocumento":
+                continue
+            for child in gen.iter():
+                name = _local_tag(child)
+                if name == "Data" and year is None:
+                    y = _parse_invoice_year((child.text or "").strip())
+                    if y:
+                        year = y
+                elif name == "TipoDocumento" and tipo_doc is None:
+                    tipo_doc = (child.text or "").strip() or None
+                elif name == "ImportoTotaleDocumento" and not totale:
+                    totale = _parse_amount(child.text)
+                elif name == "ImportoRitenuta":
+                    # An invoice can carry multiple <DatiRitenuta> blocks
+                    # (RT01, RT02, ...). Sum all ImportoRitenuta entries.
+                    ritenute += _parse_amount(child.text)
+            break  # only one DatiGeneraliDocumento per body
+
+        imposta = 0.0
+        imponibile = 0.0
+        for dr in body.iter():
+            if _local_tag(dr) != "DatiRiepilogo":
+                continue
+            for child in dr:
+                name = _local_tag(child)
+                if name == "Imposta":
+                    imposta += _parse_amount(child.text)
+                elif name == "ImponibileImporto":
+                    imponibile += _parse_amount(child.text)
+
+        records.append({
+            "year": year,
+            "tipo_documento": tipo_doc,
+            "imponibile": imponibile,
+            "imposta": imposta,
+            "totale": totale,
+            "ritenute": ritenute,
+        })
+
+    return records
 
 
 # ---------------------------------------------------------------------------
@@ -179,12 +327,11 @@ def _wait_for_login(context, timeout_s: int = 300) -> bool:
     return False
 
 
-def _read_tokens_from_context(context) -> dict[str, str]:
+def _dump_localstorage(context) -> dict[str, str]:
     """
-    Read x-b2bcookie and x-token from the SPA's localStorage across all
-    open pages. localStorage is origin-scoped, so the tokens only exist
-    on pages served from ivaservizi.agenziaentrate.gov.it — we scan every
-    page rather than binding to one that might have navigated away.
+    Return a flat dump of localStorage across every open page whose origin
+    is the AdE invoices portal. localStorage is origin-scoped, so we scan
+    each page to find the one that holds the SPA's state.
     """
     for p in context.pages:
         try:
@@ -194,20 +341,36 @@ def _read_tokens_from_context(context) -> dict[str, str]:
         if "ivaservizi.agenziaentrate.gov.it" not in url:
             continue
         try:
-            result = p.evaluate("""() => ({
-                'x-b2bcookie': localStorage.getItem('FattCorrActiveB2B') || '',
-                'x-token': localStorage.getItem('FattCorrActiveToken') || '',
-            })""")
+            items = p.evaluate("""() => {
+                const out = {};
+                for (let i = 0; i < localStorage.length; i++) {
+                    const k = localStorage.key(i);
+                    out[k] = localStorage.getItem(k);
+                }
+                return out;
+            }""")
         except Exception:
             continue
-        tokens = {k: v for k, v in result.items() if v}
-        if "x-b2bcookie" in tokens and "x-token" in tokens:
-            return tokens
+        if items:
+            return items
     return {}
 
 
+def _read_tokens_from_context(context) -> dict[str, str]:
+    """Read x-b2bcookie and x-token from the SPA's localStorage."""
+    items = _dump_localstorage(context)
+    tokens: dict[str, str] = {}
+    b2b = items.get("FattCorrActiveB2B") or ""
+    tok = items.get("FattCorrActiveToken") or ""
+    if b2b:
+        tokens["x-b2bcookie"] = b2b
+    if tok:
+        tokens["x-token"] = tok
+    return tokens
+
+
 def _browser_login() -> tuple[dict[str, str], dict[str, str]]:
-    """Open bundled Chromium, wait for CIE login, extract session. Returns (cookies, headers)."""
+    """Open Chromium, wait for CIE login, extract session. Returns (cookies, headers)."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
         context = browser.new_context(viewport={"width": 1280, "height": 900})
@@ -305,26 +468,19 @@ def authenticate() -> tuple[dict[str, str], dict[str, str]]:
 # ---------------------------------------------------------------------------
 
 def _fetch_domestic(
-    session: requests.Session,
-    kind: str,
-    start: date,
-    end: date,
-    vat_id: str | None = None,
+    session: requests.Session, kind: str, start: date, end: date,
 ) -> list[dict]:
     """
-    Fetch domestic invoice list.
+    Fetch domestic invoice list. Both endpoints are session-scoped — no VAT
+    is required in the path. The portal's own SPA calls them exactly like this.
 
-    - emesse:   /fe/emesse/dal/.../al/.../piva/{piva}            (filters by issue date;
-                piva in path is typically session-scoped, but is honored under
-                delegation — pass the target VAT when operating as a delegate)
-    - ricevute: /fe/ricevute/dal/.../al/.../ricerca/ricezione    (filters by reception date;
-                authenticated user is implicit recipient)
+    - emesse:   /fe/emesse/dal/{D}/al/{D}                       (filters by issue date)
+    - ricevute: /fe/ricevute/dal/{D}/al/{D}/ricerca/ricezione   (filters by reception date)
     """
     if kind == "emesse":
-        piva = vat_id or PIVA_PATH_PLACEHOLDER
         url = (
             f"{BASE_URL}/fe/emesse/dal/{_fmt_date(start)}/al/{_fmt_date(end)}"
-            f"/piva/{piva}?v={_ts()}"
+            f"?v={_ts()}"
         )
     else:
         url = (
@@ -333,6 +489,7 @@ def _fetch_domestic(
         )
     resp = session.get(url, timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
+    _throttle()
     return resp.json().get("fatture", [])
 
 
@@ -346,18 +503,15 @@ def _fetch_cross_border(
     )
     resp = session.get(url, timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
+    _throttle()
     return resp.json().get("fatture", [])
 
 
 def fetch_invoice_list(
-    session: requests.Session,
-    kind: str,
-    start: date,
-    end: date,
-    vat_id: str | None = None,
+    session: requests.Session, kind: str, start: date, end: date,
 ) -> list[dict]:
     """Fetch both domestic and cross-border invoices, merged and deduplicated."""
-    domestic = _fetch_domestic(session, kind, start, end, vat_id=vat_id)
+    domestic = _fetch_domestic(session, kind, start, end)
     cross_border = _fetch_cross_border(session, kind, start, end)
 
     # Deduplicate by idFattura (in case an invoice appears in both)
@@ -380,7 +534,189 @@ def download_xml(session: requests.Session, send_type: str, invoice_id: str) -> 
     )
     resp = session.get(url, timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
+    _throttle()
     return resp.content
+
+
+# ---------------------------------------------------------------------------
+# Recap
+# ---------------------------------------------------------------------------
+
+# A recap record represents one invoice body contribution to the yearly totals.
+# Shape: {"year": int | None, "kind": "issued"|"received",
+#         "totale": float, "imposta": float, "domestic": bool}
+# Values may be negative for credit-note bodies (TD04/TD08) so they subtract
+# from the running totals.
+
+def _eur(x: float) -> str:
+    """Italian-style euro formatting: '€ 1.234,56'."""
+    return f"€ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _print_stats_table(
+    records: list[dict],
+    title: str,
+    footnote: str | None = None,
+) -> None:
+    stats: dict[int, dict[str, float]] = {}
+    for rec in records:
+        year = rec.get("year")
+        if year is None:
+            continue
+        bucket = stats.setdefault(year, {
+            "fatturato": 0.0, "costi": 0.0,
+            "iva_emessa": 0.0, "iva_ricevuta": 0.0,
+        })
+        if rec["kind"] == "issued":
+            bucket["fatturato"] += rec["totale"]
+            if rec["domestic"]:
+                bucket["iva_emessa"] += rec["imposta"]
+        else:
+            bucket["costi"] += rec["totale"]
+            if rec["domestic"]:
+                bucket["iva_ricevuta"] += rec["imposta"]
+
+    if not stats:
+        return
+
+    table = Table(title=title)
+    table.add_column("Anno", style="bold cyan")
+    table.add_column("Fatturato", justify="right")
+    table.add_column("Costi", justify="right")
+    table.add_column("IVA emessa (IT)", justify="right")
+    table.add_column("IVA ricevuta (IT)", justify="right")
+    table.add_column("Saldo IVA", justify="right", style="bold")
+
+    for year in sorted(stats.keys()):
+        s = stats[year]
+        table.add_row(
+            str(year),
+            _eur(s["fatturato"]),
+            _eur(s["costi"]),
+            _eur(s["iva_emessa"]),
+            _eur(s["iva_ricevuta"]),
+            _eur(s["iva_emessa"] - s["iva_ricevuta"]),
+        )
+
+    console.print()
+    console.print(table)
+    if footnote:
+        console.print(f"[dim]{footnote}[/]")
+    console.print()
+
+
+def _records_from_metadata(
+    issued: list[dict] | None,
+    received: list[dict] | None,
+) -> tuple[list[dict], int, int]:
+    """Build recap records from the listing-endpoint metadata.
+
+    Fast but IVA is NOT trustworthy — the metadata 'imposta' field is known
+    to be unreliable. Suitable for the `list` command as a rough preview.
+    Returns (records, non_commercial_excluded, credit_notes_subtracted).
+    """
+    records: list[dict] = []
+    skipped = 0
+    subtracted = 0
+
+    def _emit(inv: dict, kind: str, country_key: str) -> None:
+        nonlocal skipped, subtracted
+        td = inv.get("tipoDocumento") or ""
+        if td in NON_COMMERCIAL_TD_CODES:
+            skipped += 1
+            return
+        sign = -1.0 if td in CREDIT_NOTE_TD_CODES else 1.0
+        if sign < 0:
+            subtracted += 1
+        imponibile = _parse_amount(inv.get("imponibile"))
+        imposta = _parse_amount(inv.get("imposta"))
+        records.append({
+            "year": _parse_invoice_year(inv.get("dataFattura")),
+            "kind": kind,
+            "totale": sign * (imponibile + imposta),
+            "imposta": sign * imposta,
+            "domestic": inv.get(country_key) == "IT",
+        })
+
+    for inv in issued or []:
+        _emit(inv, "issued", "idPaeseCessionario")
+    for inv in received or []:
+        _emit(inv, "received", "idPaeseCedente")
+    return records, skipped, subtracted
+
+
+def _records_from_xml(
+    jobs: list[tuple[dict, str, Path]],
+    max_workers: int = 8,
+) -> tuple[list[dict], int, int, int, int]:
+    """Parse XMLs in parallel and build accurate recap records.
+
+    `jobs` is a list of (invoice_metadata, label, xml_path) tuples — each
+    pointing to a downloaded file on disk. Returns
+    (records, parsed, missing, skipped, subtracted):
+      - parsed     : invoices whose XML was successfully read
+      - missing    : invoices whose XML was missing / unparseable
+      - skipped    : bodies skipped (NON_COMMERCIAL_TD_CODES)
+      - subtracted : bodies subtracted (CREDIT_NOTE_TD_CODES)
+    """
+    if not jobs:
+        return [], 0, 0, 0, 0
+
+    records: list[dict] = []
+    parsed = 0
+    missing = 0
+    skipped = 0
+    subtracted = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Parsing XML for accurate IVA", total=len(jobs))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(_parse_fatturapa_xml, xml_path): (inv, label)
+                for inv, label, xml_path in jobs
+            }
+            for fut in as_completed(futures):
+                inv, label = futures[fut]
+                bodies = fut.result()
+                if not bodies:
+                    missing += 1
+                    progress.update(task, advance=1)
+                    continue
+                parsed += 1
+                domestic_key = (
+                    "idPaeseCedente" if label == "received" else "idPaeseCessionario"
+                )
+                domestic = inv.get(domestic_key) == "IT"
+                for body in bodies:
+                    td = body.get("tipo_documento") or ""
+                    if td in NON_COMMERCIAL_TD_CODES:
+                        skipped += 1
+                        continue
+                    sign = -1.0 if td in CREDIT_NOTE_TD_CODES else 1.0
+                    if sign < 0:
+                        subtracted += 1
+                    # Fatturato / costi = ImportoTotaleDocumento minus any
+                    # <ImportoRitenuta> (ritenuta d'acconto) — this is the
+                    # "netto a pagare" that accountants use as fatturato.
+                    # Fall back to imponibile+imposta if header is missing.
+                    raw_totale = body["totale"] or (body["imponibile"] + body["imposta"])
+                    netto = raw_totale - body["ritenute"]
+                    records.append({
+                        "year": body["year"] or _parse_invoice_year(inv.get("dataFattura")),
+                        "kind": label,
+                        "totale": sign * netto,
+                        "imposta": sign * body["imposta"],
+                        "domestic": domestic,
+                    })
+                progress.update(task, advance=1)
+
+    return records, parsed, missing, skipped, subtracted
 
 
 # ---------------------------------------------------------------------------
@@ -388,18 +724,32 @@ def download_xml(session: requests.Session, send_type: str, invoice_id: str) -> 
 # ---------------------------------------------------------------------------
 
 def _validate_common_args(args: argparse.Namespace) -> tuple[date, date]:
-    """Validate --vat-id (if provided) and --from, return (start_date, end_date)."""
-    if getattr(args, "vat_id", None) and not VAT_ID_RE.match(args.vat_id):
-        console.print("[bold red]Error:[/] --vat-id must be exactly 11 digits.")
-        sys.exit(1)
-    try:
-        start_date = datetime.strptime(args.from_date, "%Y-%m-%d").date()
-    except ValueError:
-        console.print("[bold red]Error:[/] --from must be YYYY-MM-DD.")
-        sys.exit(1)
-    end_date = date.today()
+    """Validate args, return (start_date, end_date). Exits on error."""
+    today = date.today()
+    if args.from_date:
+        try:
+            start_date = datetime.strptime(args.from_date, "%Y-%m-%d").date()
+        except ValueError:
+            console.print("[bold red]Error:[/] --from must be YYYY-MM-DD.")
+            sys.exit(1)
+    else:
+        start_date = today - timedelta(days=365)
+    if args.to_date:
+        try:
+            end_date = datetime.strptime(args.to_date, "%Y-%m-%d").date()
+        except ValueError:
+            console.print("[bold red]Error:[/] --to must be YYYY-MM-DD.")
+            sys.exit(1)
+    else:
+        end_date = today
     if start_date > end_date:
+        console.print("[bold red]Error:[/] --from is after --to.")
+        sys.exit(1)
+    if start_date > today:
         console.print("[bold red]Error:[/] --from date is in the future.")
+        sys.exit(1)
+    if end_date > today:
+        console.print("[bold red]Error:[/] --to date is in the future.")
         sys.exit(1)
     span_days = (end_date - start_date).days
     if span_days > 366 * 2:
@@ -448,9 +798,12 @@ def cmd_download(args: argparse.Namespace) -> None:
         f"({len(ranges)} window{'s' if len(ranges) > 1 else ''} of max 3 months)\n"
     )
 
+    # Jobs for the post-download XML parser: (invoice_metadata, label, xml_path).
+    parse_jobs: list[tuple[dict, str, Path]] = []
+
     for api_kind, label in kinds:
-        out_dir = out_root / label
-        out_dir.mkdir(parents=True, exist_ok=True)
+        label_dir = out_root / label
+        label_dir.mkdir(parents=True, exist_ok=True)
 
         # Fetch invoice lists across all date windows
         all_invoices: list[dict] = []
@@ -460,7 +813,7 @@ def cmd_download(args: argparse.Namespace) -> None:
                 spinner="dots",
             ):
                 invoices = fetch_invoice_list(
-                    session, api_kind, r_start, r_end, vat_id=args.vat_id,
+                    session, api_kind, r_start, r_end,
                 )
                 all_invoices.extend(invoices)
             console.print(
@@ -503,7 +856,7 @@ def cmd_download(args: argparse.Namespace) -> None:
         console.print(table)
         console.print()
 
-        # Download XMLs
+        # Download XMLs — each goes under <label>/<year>/<italiane|transfrontaliere>/.
         downloadable = [
             inv for inv in all_invoices
             if inv.get("fileDownload", {}).get("fileDownload", 0) == 1
@@ -525,27 +878,63 @@ def cmd_download(args: argparse.Namespace) -> None:
                 send_type = inv["tipoInvio"]
                 invoice_id = inv["idFattura"]
                 number = inv.get("numeroFattura", "N/A")
-                file_id = f"{send_type}{invoice_id}"
-                out_file = out_dir / f"{file_id}.xml"
+                out_file = _invoice_output_path(inv, label_dir, label)
+                out_file.parent.mkdir(parents=True, exist_ok=True)
 
                 if out_file.exists():
                     progress.update(task, advance=1, description=f"[dim]{number} (cached)[/]")
+                    parse_jobs.append((inv, label, out_file))
                     continue
 
                 progress.update(task, description=f"{number}")
                 try:
                     xml_data = download_xml(session, send_type, invoice_id)
                     out_file.write_bytes(xml_data)
+                    parse_jobs.append((inv, label, out_file))
                 except requests.HTTPError as e:
                     console.print(f"  [red]Error downloading {number}:[/] {e}")
 
                 progress.update(task, advance=1)
-                time.sleep(0.5)
 
-        # Save JSON summary
-        summary_file = out_dir / "summary.json"
-        summary_file.write_text(json.dumps(all_invoices, indent=2, ensure_ascii=False))
-        console.print(f"[dim]Summary saved to {summary_file}[/]\n")
+        # Write one summary.json per year, bundling invoices under that year
+        # regardless of their italiane/transfrontaliere split.
+        by_year: dict[str, list[dict]] = {}
+        for inv in all_invoices:
+            by_year.setdefault(_invoice_year_folder(inv), []).append(inv)
+        for year_key, year_invoices in by_year.items():
+            year_dir = label_dir / year_key
+            year_dir.mkdir(parents=True, exist_ok=True)
+            (year_dir / "summary.json").write_text(
+                json.dumps(year_invoices, indent=2, ensure_ascii=False)
+            )
+        console.print(
+            f"[dim]Summaries saved under {label_dir}/<year>/summary.json "
+            f"({len(by_year)} year{'s' if len(by_year) != 1 else ''})[/]\n"
+        )
+
+    records, parsed, missing, skipped, subtracted = _records_from_xml(parse_jobs)
+    note_parts = [
+        "Fatturato/Costi = sum of <ImportoTotaleDocumento> (grand total, incl. IVA). "
+        "IVA totals are restricted to domestic IT→IT transactions.",
+    ]
+    if subtracted:
+        note_parts.append(
+            f"{subtracted} credit note(s) (TD04/TD08) subtracted from totals."
+        )
+    if skipped:
+        note_parts.append(
+            f"{skipped} tax-integration doc(s) (TD16–TD23/TD28) excluded."
+        )
+    if missing:
+        note_parts.append(
+            f"{missing} invoice(s) excluded (XML missing or unparseable)."
+        )
+    if parsed:
+        _print_stats_table(
+            records,
+            title="Recap per anno d'imposta (XML-accurate)",
+            footnote=" ".join(note_parts),
+        )
 
     console.print("[bold green]Done![/]")
 
@@ -570,6 +959,8 @@ def cmd_list(args: argparse.Namespace) -> None:
 
     ranges = _date_ranges(start_date, end_date)
 
+    collected: dict[str, list[dict]] = {}
+
     for api_kind, label in kinds:
         all_invoices: list[dict] = []
         for r_start, r_end in ranges:
@@ -578,10 +969,10 @@ def cmd_list(args: argparse.Namespace) -> None:
                 spinner="dots",
             ):
                 all_invoices.extend(
-                    fetch_invoice_list(
-                        session, api_kind, r_start, r_end, vat_id=args.vat_id,
-                    )
+                    fetch_invoice_list(session, api_kind, r_start, r_end)
                 )
+
+        collected[label] = all_invoices
 
         if not all_invoices:
             console.print(f"No {label} invoices found.\n")
@@ -621,6 +1012,24 @@ def cmd_list(args: argparse.Namespace) -> None:
         console.print(table)
         console.print()
 
+    records, meta_skipped, meta_subtracted = _records_from_metadata(
+        collected.get("issued"), collected.get("received"),
+    )
+    note = (
+        "Preview only — computed from listing-endpoint metadata (IVA values "
+        "from AdE may be inaccurate). Run `download` for authoritative "
+        "totals recomputed from each XML."
+    )
+    if meta_subtracted:
+        note += f" {meta_subtracted} credit note(s) subtracted."
+    if meta_skipped:
+        note += f" {meta_skipped} tax-integration doc(s) excluded."
+    _print_stats_table(
+        records,
+        title="Recap per anno d'imposta (metadata preview)",
+        footnote=note,
+    )
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -635,12 +1044,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     # -- download --
     dl = subparsers.add_parser("download", help="Download invoice XML files")
-    dl.add_argument("--from", dest="from_date", required=True, help="Start date (YYYY-MM-DD)")
     dl.add_argument(
-        "--vat-id",
-        default=None,
-        help="Target VAT (Partita IVA). Only needed when operating under "
-             "delegation for a third party; omit for self-service.",
+        "--from", dest="from_date", default=None,
+        help="Start date (YYYY-MM-DD). Default: 365 days before today.",
+    )
+    dl.add_argument(
+        "--to", dest="to_date", default=None,
+        help="End date (YYYY-MM-DD). Default: today.",
     )
     dl.add_argument(
         "--type",
@@ -649,21 +1059,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Invoice type to download (default: issued)",
     )
     dl.add_argument("--output", default="output", help="Output directory (default: output)")
+    dl.add_argument(
+        "--delay", type=float, default=0.5,
+        help="Seconds to wait after each AdE API call (default: 0.5). Use 0 "
+             "to disable throttling, or raise it (e.g. 2) for gentler pacing.",
+    )
 
     # -- list --
     ls = subparsers.add_parser("list", help="List invoices without downloading")
-    ls.add_argument("--from", dest="from_date", required=True, help="Start date (YYYY-MM-DD)")
     ls.add_argument(
-        "--vat-id",
-        default=None,
-        help="Target VAT (Partita IVA). Only needed when operating under "
-             "delegation for a third party; omit for self-service.",
+        "--from", dest="from_date", default=None,
+        help="Start date (YYYY-MM-DD). Default: 365 days before today.",
+    )
+    ls.add_argument(
+        "--to", dest="to_date", default=None,
+        help="End date (YYYY-MM-DD). Default: today.",
     )
     ls.add_argument(
         "--type",
         choices=["issued", "received", "all"],
         default="issued",
         help="Invoice type to list (default: issued)",
+    )
+    ls.add_argument(
+        "--delay", type=float, default=0.5,
+        help="Seconds to wait after each AdE API call (default: 0.5). Use 0 "
+             "to disable throttling, or raise it (e.g. 2) for gentler pacing.",
     )
 
     return parser
@@ -672,6 +1093,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.delay < 0:
+        console.print("[bold red]Error:[/] --delay must be >= 0.")
+        sys.exit(1)
+
+    global API_DELAY
+    API_DELAY = args.delay
 
     if args.command == "download":
         cmd_download(args)
