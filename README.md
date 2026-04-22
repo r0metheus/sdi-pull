@@ -1,10 +1,10 @@
 # sdi-pull
 
-CLI tool to bulk-download electronic invoices (Fatture Elettroniche) as XML from the Italian Revenue Agency (Agenzia delle Entrate) portal — the invoices managed by the SdI (Sistema di Interscambio).
+CLI tool to bulk-download electronic invoices (Fatture Elettroniche) as XML from the Italian Revenue Agency (Agenzia delle Entrate) portal, the invoices managed by the SdI (Sistema di Interscambio).
 
 ## Intended use
 
-This tool is for **personal use by the holder of the credentials**. It logs in with **your** CIE (or SPID/CNS, if the portal allows) via a real browser you control, captures **your** session tokens from **your** browser's localStorage, and downloads **your own** invoices through the same public API endpoints the official web console (`ivaservizi.agenziaentrate.gov.it/cons/cons-web/`) already calls.
+This tool is for **personal use by the holder of the credentials**. It logs in with **your** CIE (or SPID/CNS) via a real browser you control, captures **your** session tokens from **your** browser's localStorage, and downloads **your own** invoices through the same public API endpoints the official web console (`ivaservizi.agenziaentrate.gov.it/cons/cons-web/`) already calls.
 
 It does **not**:
 
@@ -32,42 +32,59 @@ The portal limits queries to 3-month windows — the tool handles this automatic
 
 ## Installation
 
+The only prerequisite is [uv](https://docs.astral.sh/uv/).
+
 ```bash
-git clone <repo-url> && cd sdi-pull
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-playwright install chromium
+# Install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Clone and enter the repo
+git clone https://github.com/r0metheus/sdi-pull && cd sdi-pull
+
+# Install the Chromium build used for CIE login
+uv run playwright install chromium
 ```
 
-The `playwright install chromium` step downloads a self-contained Chromium build — no system browser required.
+> **First run is slow-ish** (~30 seconds): uv downloads Python and the dependencies once, caches them, and subsequent runs are instant.
 
 ## Usage
+
+The script is self-contained and you can run it directly:
+
+```bash
+./sdi-pull.py download --from 2026-01-01
+```
+
+Or explicitly through uv:
+
+```bash
+uv run sdi-pull.py download --from 2026-01-01
+```
 
 ### Download invoices
 
 ```bash
-# Download all issued invoices from Jan 1, 2026 to today
-python sdi-pull.py download --from 2026-01-01
+# All issued invoices from Jan 1, 2026 to today
+./sdi-pull.py download --from 2026-01-01
 
-# Download received invoices only
-python sdi-pull.py download --from 2026-01-01 --type received
+# Received invoices only
+./sdi-pull.py download --from 2026-01-01 --type received
 
-# Download both issued and received
-python sdi-pull.py download --from 2026-01-01 --type all
+# Both issued and received
+./sdi-pull.py download --from 2026-01-01 --type all
 
 # Custom output directory
-python sdi-pull.py download --from 2026-01-01 --output ./my-invoices
+./sdi-pull.py download --from 2026-01-01 --output ./my-invoices
+
+# Operating under delegation for a third-party VAT
+./sdi-pull.py download --from 2026-01-01 --vat-id 12345678901
 ```
 
 ### List invoices (no download)
 
 ```bash
-# List issued invoices
-python sdi-pull.py list --from 2026-01-01
-
-# List all invoices (issued + received)
-python sdi-pull.py list --from 2026-01-01 --type all
+./sdi-pull.py list --from 2026-01-01
+./sdi-pull.py list --from 2026-01-01 --type all
 ```
 
 ### Commands reference
@@ -125,7 +142,20 @@ Each XML file is the original electronic invoice as stored by AdE. The `summary.
 
 ## Requirements
 
-- Python 3.10+
+- [uv](https://docs.astral.sh/uv/) (installs Python 3.10+ and all dependencies automatically)
+- A working [CIE](https://www.cartaidentita.interno.gov.it/) (Italian electronic identity card) with either an NFC reader or the [CieID](https://www.cartaidentita.interno.gov.it/cie-id/) mobile app for QR authentication
+
+## For contributors
+
+If you want a persistent dev environment instead of one-shot script runs:
+
+```bash
+uv sync                               # install deps into .venv
+uv run playwright install chromium    # one-time browser setup
+uv run sdi-pull.py --help             # run within the env
+```
+
+Dependency versions are pinned with hashes in `uv.lock` — commit it together with any change to `pyproject.toml`.
 
 ## License
 

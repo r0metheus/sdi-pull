@@ -1,4 +1,12 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "playwright>=1.50.0",
+#     "requests>=2.31.0",
+#     "rich>=13.0.0",
+# ]
+# ///
 """
 sdi-pull - Download electronic invoices (XML) from the Italian SdI
 (Sistema di Interscambio) via the Agenzia delle Entrate portal.

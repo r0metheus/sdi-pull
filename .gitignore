@@ -1,4 +1,23 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+
+# uv
+# uv.lock is committed on purpose (reproducible builds, supply-chain hygiene)
+.uv/
+
+# Build artifacts
+dist/
+build/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Project-local
 output/
+

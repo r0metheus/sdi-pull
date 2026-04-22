@@ -1,0 +1,30 @@
+[project]
+name = "sdi-pull"
+version = "0.1.0"
+description = "Bulk-download Italian electronic invoices (XML) from Agenzia delle Entrate via CIE login."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "AGPL-3.0-or-later"
+authors = [
+    { name = "sdi-pull contributors" },
+]
+keywords = [
+    "fatture-elettroniche",
+    "agenzia-delle-entrate",
+    "sdi",
+    "cie",
+    "e-invoicing",
+    "italy",
+    "cli",
+]
+dependencies = [
+    "playwright>=1.50.0",
+    "requests>=2.31.0",
+    "rich>=13.0.0",
+]
+
+[project.urls]
+Repository = "https://github.com/r0metheus/sdi-pull"
+
+[tool.uv]
+package = false
